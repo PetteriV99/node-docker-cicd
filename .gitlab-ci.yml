@@ -1,0 +1,96 @@
+# Using docker image and docker service are both needed for using docker in Gitlab
+image: docker:latest
+stages:
+  - build
+  - test
+  - release
+  - deploy
+variables:
+  # Important variables are defined here
+  DOCKER_HOST: tcp://docker:2375/
+  DOCKER_DRIVER: overlay2
+  # See https://github.com/docker-library/docker/pull/166
+  DOCKER_TLS_CERTDIR: ""
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  CONTAINER_RELEASE_IMAGE: $CI_REGISTRY_IMAGE:latest
+  # Gives debug messages, disable if not needed
+  CI_DEBUG_SERVICES: "true"
+services:
+  # If using services on other stages, this service needs to be defined every time docker is used!
+  - name: docker:dind
+    entrypoint: ["env", "-u", "DOCKER_HOST"]
+    command: ["dockerd-entrypoint.sh"]
+    alias: docker
+
+# Image is build for testing or production
+
+build:
+  stage: build
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD private-repository:5050
+    # We need to add the env file into the image depending on the branch
+    # Only needed if not using multiple env files and appropriate environment in Node
+    - |
+      if [$CI_COMMIT_REF_NAME == production]; then
+        cp ${PRODUCTION_ENV_FILE} .env
+      else
+        cp ${TESTING_ENV_FILE} .env
+      fi
+  script:
+    # As our Dockerfile has two different entrypoints, we will switch between them
+    - |
+      if [$CI_COMMIT_REF_NAME == production]; then
+        docker build -t $IMAGE_TAG --target prod .
+      else
+        docker build -t $IMAGE_TAG --target test .
+      fi
+    - docker push $IMAGE_TAG
+  only:
+  # Pipeline is only actived on these branches and on merge requests
+  - as_development
+  - production
+  - merge_requests
+
+# Using docker compose we create a database container and run our tests
+
+test:
+  stage: test
+  needs: ["build"]
+  variables:
+    # This is needed in order to networking work on the runner used in making this
+    # Probably not needed on other runners
+    FF_NETWORK_PER_BUILD: "true" 
+  before_script:
+    # We login into the registry we have on our Gitlab
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD private-repository:5050
+  script:
+    # Testing is done using docker-compose file
+    - docker compose up --exit-code-from node_test
+  only:
+  - as_development
+  - production
+  - merge_requests
+
+# We pull the image from the registry, retagit and then push it back under the latest tag
+
+release:
+  stage: release
+  needs: ["build", "test"]
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD private-repository:5050
+  script:
+    - docker pull $IMAGE_TAG
+    - docker tag $IMAGE_TAG $CONTAINER_RELEASE_IMAGE
+    - docker push $CONTAINER_RELEASE_IMAGE
+  only:
+    - production
+
+# Deploy in production to your server
+
+deploy:
+  stage: deploy
+  needs: ["build", "test", "release"]
+  script:
+    - echo "Deploying to the server"
+  only:
+    - production
